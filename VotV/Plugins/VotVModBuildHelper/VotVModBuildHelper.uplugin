@@ -1,0 +1,24 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "VotVModBuildHelper",
+	"Description": "An Unreal Plugin to help VotV Mod Developers with setup and iterative Mod Builds",
+	"Category": "Other",
+	"CreatedBy": "Thowan",
+	"CreatedByURL": "https://github.com/thowan-codes",
+	"DocsURL": "https://github.com/thowan-codes/VotV-Mod-Build-Helper",
+	"MarketplaceURL": "",
+	"SupportURL": "https://github.com/thowan-codes/VotV-Mod-Build-Helper",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "VotVModBuildHelper",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	]
+}
