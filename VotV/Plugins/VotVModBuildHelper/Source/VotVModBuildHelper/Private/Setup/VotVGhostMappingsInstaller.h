@@ -10,11 +10,11 @@ DECLARE_DELEGATE_TwoParams(
     const FString&
 );
 
-/** Downloads a ghost-mappings GitHub archive and merges its Content folder into the project. */
+/** Incrementally updates cached ghost mappings and can repair existing mapping compatibility. */
 class FVotVGhostMappingsInstaller
 {
 public:
-    /** Calls OnComplete once the download and content merge have either succeeded or failed. */
+    /** Calls OnComplete once the update or local compatibility repair has succeeded or failed. */
     static void DownloadAndInstall(
         const UVotVSetupOptions& SetupOptions,
         FVotVGhostMappingsCompleteDelegate OnComplete

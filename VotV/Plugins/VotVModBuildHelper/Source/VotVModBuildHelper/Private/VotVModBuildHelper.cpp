@@ -193,7 +193,8 @@ void FVotVModBuildHelperModule::RunSetup()
 
 	// Downloading is asynchronous.  Wait to show the final result and restart
 	// prompt until the archive has either been merged or reported as failed.
-	if (SetupOptions->bImportGhostMappings)
+	if (SetupOptions->bImportGhostMappings ||
+		SetupOptions->bRemoveUnsupportedAudioDeviceMapping)
 	{
 		FVotVGhostMappingsInstaller::DownloadAndInstall(
 			*SetupOptions,

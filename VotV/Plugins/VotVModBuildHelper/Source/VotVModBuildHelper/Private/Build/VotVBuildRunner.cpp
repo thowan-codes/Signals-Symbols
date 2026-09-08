@@ -450,6 +450,10 @@ namespace
     {
         if (!Result.Equals(TEXT("Completed"), ESearchCase::CaseSensitive))
         {
+            OutMessage =
+                TEXT("Packaging failed before the .pak could be collected. ")
+                TEXT("Open Window > Developer Tools > Output Log and search for ")
+                TEXT("the first UATHelper: Package Mod error.");
             return false;
         }
 
@@ -551,7 +555,10 @@ bool FVotVBuildRunner::Start(
         ? TEXT(" -installed")
         : TEXT("");
     const FString CommandLine = FString::Printf(
-        TEXT("-ScriptsForProject=\"%s\" BuildCookRun -nop4%s -project=\"%s\" -build -cook -stage -archive -archivedirectory=\"%s\" -package -pak -platform=Win64 -clientconfig=Development -ue4exe=\"%s\" -utf8output"),
+        // The editor is already running the project binaries.  Asking UAT to
+        // rebuild here makes it try to delete the active hot-reload DLL, which
+        // Windows locks and causes packaging to fail before cooking begins.
+        TEXT("-ScriptsForProject=\"%s\" BuildCookRun -nop4%s -project=\"%s\" -cook -stage -archive -archivedirectory=\"%s\" -package -pak -platform=Win64 -clientconfig=Development -ue4exe=\"%s\" -utf8output"),
         *ProjectPath,
         *InstalledEngineArgument,
         *ProjectPath,
@@ -560,58 +567,110 @@ bool FVotVBuildRunner::Start(
     );
 
     const TWeakObjectPtr<UVotVBuildOptions> WeakBuildOptions(&BuildOptions);
-
-    IUATHelperModule::Get().CreateUatTask(
-        CommandLine,
-        FText::FromString(TEXT("Windows (64-bit)")),
-        FText::FromString(TEXT("Packaging VotV mod")),
-        FText::FromString(TEXT("Package Mod")),
-        nullptr,
-        [Plan, WeakBuildOptions](FString Result, double)
-        {
-            AsyncTask(ENamedThreads::GameThread, [Plan, Result, WeakBuildOptions]()
+    const auto StartPackaging = [Plan, CommandLine, WeakBuildOptions]()
+    {
+        IUATHelperModule::Get().CreateUatTask(
+            CommandLine,
+            FText::FromString(TEXT("Windows (64-bit)")),
+            FText::FromString(TEXT("Packaging VotV mod")),
+            FText::FromString(TEXT("Package Mod")),
+            nullptr,
+            [Plan, WeakBuildOptions](FString Result, double)
             {
-                FString CompletionMessage;
-                const bool bPakCopied = FinishBuild(
-                    Plan,
-                    Result,
-                    CompletionMessage
-                );
-
-                if (bPakCopied && WeakBuildOptions.IsValid())
+                AsyncTask(ENamedThreads::GameThread, [Plan, Result, WeakBuildOptions]()
                 {
-                    UVotVBuildOptions* CompletedBuildOptions =
-                        WeakBuildOptions.Get();
-                    if (CompletedBuildOptions->bEnableBuildIds)
-                    {
-                        if (Plan.BuildConfiguration == EVotVBuildType::Development)
-                        {
-                            ++CompletedBuildOptions->DevelopmentBuildId;
-                        }
-                        else
-                        {
-                            ++CompletedBuildOptions->ReleaseBuildId;
-                        }
+                    FString CompletionMessage;
+                    const bool bPakCopied = FinishBuild(
+                        Plan,
+                        Result,
+                        CompletionMessage
+                    );
 
-                        CompletedBuildOptions->RefreshDerivedValues();
-                        CompletedBuildOptions->SaveConfig();
-                        CompletionMessage += TEXT(
-                            "\n\nThe successful build advanced the active Build ID."
+                    if (bPakCopied && WeakBuildOptions.IsValid())
+                    {
+                        UVotVBuildOptions* CompletedBuildOptions =
+                            WeakBuildOptions.Get();
+                        if (CompletedBuildOptions->bEnableBuildIds)
+                        {
+                            if (Plan.BuildConfiguration == EVotVBuildType::Development)
+                            {
+                                ++CompletedBuildOptions->DevelopmentBuildId;
+                            }
+                            else
+                            {
+                                ++CompletedBuildOptions->ReleaseBuildId;
+                            }
+
+                            CompletedBuildOptions->RefreshDerivedValues();
+                            CompletedBuildOptions->SaveConfig();
+                            CompletionMessage += TEXT(
+                                "\n\nThe successful build advanced the active Build ID."
+                            );
+                        }
+                    }
+
+                    if (!CompletionMessage.IsEmpty())
+                    {
+                        FMessageDialog::Open(
+                            EAppMsgType::Ok,
+                            FText::FromString(CompletionMessage)
                         );
                     }
-                }
+                });
+            },
+            Plan.DestinationDirectory
+        );
+    };
 
-                if (!CompletionMessage.IsEmpty())
+    const FString GameTargetReceipt = FPaths::Combine(
+        FPaths::ProjectDir(),
+        TEXT("Binaries"),
+        TEXT("Win64"),
+        FPaths::GetBaseFilename(ProjectPath) + TEXT(".target")
+    );
+
+    if (!FPaths::FileExists(GameTargetReceipt))
+    {
+        // Blueprint-only projects often have no game receipt until UAT creates
+        // its temporary target and builds it once. Do that separately from the
+        // package task so ordinary C++ projects never rebuild active editor DLLs.
+        const FString PreflightCommandLine = FString::Printf(
+            TEXT("-ScriptsForProject=\"%s\" BuildCookRun -nop4%s -project=\"%s\" -build -skipcook -skipstage -nocompileeditor -platform=Win64 -clientconfig=Development -utf8output"),
+            *ProjectPath,
+            *InstalledEngineArgument,
+            *ProjectPath
+        );
+
+        IUATHelperModule::Get().CreateUatTask(
+            PreflightCommandLine,
+            FText::FromString(TEXT("Windows (64-bit)")),
+            FText::FromString(TEXT("Preparing VotV project for packaging")),
+            FText::FromString(TEXT("Prepare Mod")),
+            nullptr,
+            [StartPackaging](FString Result, double)
+            {
+                AsyncTask(ENamedThreads::GameThread, [Result, StartPackaging]()
                 {
+                    if (Result.Equals(TEXT("Completed"), ESearchCase::CaseSensitive))
+                    {
+                        StartPackaging();
+                        return;
+                    }
+
                     FMessageDialog::Open(
                         EAppMsgType::Ok,
-                        FText::FromString(CompletionMessage)
+                        FText::FromString(TEXT(
+                            "The project target could not be prepared for packaging. "
+                            "Open Window > Developer Tools > Output Log and find the first UATHelper error."
+                        ))
                     );
-                }
-            });
-        },
-        Plan.DestinationDirectory
-    );
+                });
+            }
+        );
+        return true;
+    }
+
+    StartPackaging();
 
     return true;
 }

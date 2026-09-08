@@ -2,19 +2,26 @@
 
 #include "VotVSetupOptions.h"
 
+#include "AssetRegistryModule.h"
+#include "Async/Async.h"
+#include "EdGraph/EdGraph.h"
+#include "Engine/Blueprint.h"
+#include "Framework/Notifications/NotificationManager.h"
+#include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
-#include "HAL/PlatformMisc.h"
 #include "HAL/PlatformProcess.h"
-#include "HttpModule.h"
-#include "Interfaces/IHttpRequest.h"
-#include "Interfaces/IHttpResponse.h"
-#include "Misc/FileHelper.h"
-#include "Misc/Guid.h"
+#include "IAssetRegistry.h"
+#include "Kismet2/BlueprintEditorUtils.h"
+#include "Kismet2/KismetEditorUtilities.h"
 #include "Misc/Paths.h"
+#include "Misc/ScopedSlowTask.h"
+#include "Modules/ModuleManager.h"
+#include "Widgets/Notifications/SNotificationList.h"
 
 namespace
 {
-    TSharedPtr<IHttpRequest, ESPMode::ThreadSafe> ActiveDownloadRequest;
+    bool bInstallationInProgress = false;
+    TSharedPtr<SNotificationItem> ProgressNotification;
 
     bool IsSafeGitHubSegment(const FString& Segment)
     {
@@ -55,26 +62,210 @@ namespace
         return true;
     }
 
+    void ShowProgress(const FString& Message)
+    {
+        if (!ProgressNotification.IsValid())
+        {
+            FNotificationInfo Info(FText::FromString(Message));
+            Info.bFireAndForget = false;
+            Info.ExpireDuration = 0.0f;
+            Info.FadeOutDuration = 0.25f;
+            ProgressNotification =
+                FSlateNotificationManager::Get().AddNotification(Info);
+        }
+
+        if (ProgressNotification.IsValid())
+        {
+            ProgressNotification->SetText(FText::FromString(Message));
+        }
+    }
+
     void Complete(
         FVotVGhostMappingsCompleteDelegate OnComplete,
         bool bSucceeded,
         const FString& Message
     )
     {
-        ActiveDownloadRequest.Reset();
+        bInstallationInProgress = false;
+
+        if (ProgressNotification.IsValid())
+        {
+            ProgressNotification->SetText(FText::FromString(Message));
+            ProgressNotification->SetCompletionState(
+                bSucceeded
+                    ? SNotificationItem::CS_Success
+                    : SNotificationItem::CS_Fail
+            );
+            ProgressNotification->ExpireAndFadeout();
+            ProgressNotification.Reset();
+        }
+
         OnComplete.ExecuteIfBound(bSucceeded, Message);
     }
 
-    FString GetSystemExecutable(const TCHAR* FileName)
+    bool RunGit(
+        const FString& Arguments,
+        FString& OutError,
+        FString* OutOutput = nullptr
+    )
     {
-        const FString Candidate = FPaths::Combine(
-            FPlatformMisc::GetEnvironmentVariable(TEXT("WINDIR")),
-            TEXT("System32"),
-            FileName
+        int32 ExitCode = INDEX_NONE;
+        FString Output;
+        const bool bStarted = FPlatformProcess::ExecProcess(
+            TEXT("git.exe"),
+            *Arguments,
+            &ExitCode,
+            &Output,
+            &OutError
         );
-        return FPlatformFileManager::Get().GetPlatformFile().FileExists(*Candidate)
-            ? Candidate
-            : FString(FileName);
+
+        if (!bStarted || ExitCode != 0)
+        {
+            OutError = FString::Printf(
+                TEXT("git started: %s, exit code: %d. %s"),
+                bStarted ? TEXT("yes") : TEXT("no"),
+                ExitCode,
+                *OutError.Right(1000)
+            );
+            return false;
+        }
+
+        if (OutOutput != nullptr)
+        {
+            *OutOutput = Output;
+        }
+
+        return true;
+    }
+
+    void FindAssetFiles(
+        const FString& SourceContentDirectory,
+        TArray<FString>& OutDestinationFiles
+    )
+    {
+        TArray<FString> SourceFiles;
+        IFileManager::Get().FindFilesRecursive(
+            SourceFiles,
+            *SourceContentDirectory,
+            TEXT("*.uasset"),
+            true,
+            false,
+            false
+        );
+        IFileManager::Get().FindFilesRecursive(
+            SourceFiles,
+            *SourceContentDirectory,
+            TEXT("*.umap"),
+            true,
+            false,
+            false
+        );
+
+        OutDestinationFiles.Reserve(SourceFiles.Num());
+        for (const FString& SourceFile : SourceFiles)
+        {
+            FString RelativeFile = SourceFile;
+            FPaths::MakePathRelativeTo(
+                RelativeFile,
+                *SourceContentDirectory
+            );
+            OutDestinationFiles.Add(FPaths::Combine(
+                FPaths::ProjectContentDir(),
+                RelativeFile
+            ));
+        }
+    }
+
+    int32 RemoveNamedGraphs(
+        UBlueprint* Blueprint,
+        const FName GraphName
+    )
+    {
+        if (Blueprint == nullptr)
+        {
+            return 0;
+        }
+
+        TArray<UEdGraph*> GraphsToRemove;
+        auto CollectNamedGraphs =
+            [&GraphsToRemove, GraphName](const TArray<UEdGraph*>& Graphs)
+            {
+                for (UEdGraph* Graph : Graphs)
+                {
+                    if (Graph != nullptr && Graph->GetFName() == GraphName)
+                    {
+                        GraphsToRemove.AddUnique(Graph);
+                    }
+                }
+            };
+
+        CollectNamedGraphs(Blueprint->FunctionGraphs);
+        CollectNamedGraphs(Blueprint->EventGraphs);
+        CollectNamedGraphs(Blueprint->MacroGraphs);
+        CollectNamedGraphs(Blueprint->DelegateSignatureGraphs);
+
+        if (GraphsToRemove.Num() == 0)
+        {
+            return 0;
+        }
+
+        Blueprint->Modify();
+        for (UEdGraph* Graph : GraphsToRemove)
+        {
+            FBlueprintEditorUtils::RemoveGraph(
+                Blueprint,
+                Graph,
+                EGraphRemoveFlags::MarkTransient
+            );
+        }
+
+        FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+        FKismetEditorUtilities::CompileBlueprint(Blueprint);
+        Blueprint->MarkPackageDirty();
+        return GraphsToRemove.Num();
+    }
+
+    FString RemoveUnsupportedAudioDeviceMappings()
+    {
+        constexpr const TCHAR* AudioDeviceFunctionName = TEXT("getAudioDevices");
+        const FName GraphName(AudioDeviceFunctionName);
+
+        UBlueprint* CommunicationsInterface = Cast<UBlueprint>(
+            StaticLoadObject(
+                UBlueprint::StaticClass(),
+                nullptr,
+                TEXT("/Game/main/interfaces/int_coms.int_coms"),
+                nullptr,
+                LOAD_NoWarn
+            )
+        );
+        UBlueprint* MainGameMode = Cast<UBlueprint>(
+            StaticLoadObject(
+                UBlueprint::StaticClass(),
+                nullptr,
+                TEXT("/Game/main/mainGamemode.mainGamemode"),
+                nullptr,
+                LOAD_NoWarn
+            )
+        );
+
+        const int32 RemovedInterfaceGraphs = RemoveNamedGraphs(
+            CommunicationsInterface,
+            GraphName
+        );
+        const int32 RemovedGameModeGraphs = RemoveNamedGraphs(
+            MainGameMode,
+            GraphName
+        );
+        const int32 RemovedGraphs =
+            RemovedInterfaceGraphs + RemovedGameModeGraphs;
+
+        return RemovedGraphs > 0
+            ? FString::Printf(
+                TEXT(" Removed %d unsupported getAudioDevices mapping graph(s); mainGamemode pLog functions remain available."),
+                RemovedGraphs
+            )
+            : TEXT("");
     }
 }
 
@@ -91,12 +282,47 @@ void FVotVGhostMappingsInstaller::DownloadAndInstall(
     );
     return;
 #else
-    if (ActiveDownloadRequest.IsValid())
+    if (bInstallationInProgress)
     {
         Complete(
             OnComplete,
             false,
             TEXT("Skipped ghost mappings: a ghost-mappings download is already in progress.")
+        );
+        return;
+    }
+
+    const bool bUpdateGhostMappings = SetupOptions.bImportGhostMappings;
+    const bool bRemoveUnsupportedAudioDeviceMapping =
+        SetupOptions.bRemoveUnsupportedAudioDeviceMapping;
+
+    // This repair is deliberately independent of downloading.  It lets an
+    // already-imported project remove the unsupported mapping without network
+    // access or another Git LFS transfer.
+    if (!bUpdateGhostMappings)
+    {
+        bInstallationInProgress = true;
+        ShowProgress(TEXT("Ghost mappings: applying compatibility settings..."));
+
+        AsyncTask(ENamedThreads::GameThread,
+            [OnComplete, bRemoveUnsupportedAudioDeviceMapping]()
+            {
+                const FString CompatibilityResult =
+                    bRemoveUnsupportedAudioDeviceMapping
+                    ? RemoveUnsupportedAudioDeviceMappings()
+                    : TEXT("");
+
+                Complete(
+                    OnComplete,
+                    true,
+                    CompatibilityResult.IsEmpty()
+                    ? TEXT("Ghost mappings were not downloaded or updated. Existing mappings were left unchanged.")
+                    : FString::Printf(
+                        TEXT("Ghost mappings were not downloaded or updated.%s Save All, then restart the editor."),
+                        *CompatibilityResult
+                    )
+                );
+            }
         );
         return;
     }
@@ -113,159 +339,302 @@ void FVotVGhostMappingsInstaller::DownloadAndInstall(
         return;
     }
 
-    const FString TemporaryDirectory = FPaths::Combine(
-        FPaths::ProjectIntermediateDir(),
+    // Saved is intentional: Intermediate may be deleted by a clean build, but
+    // this clone is the cache that makes later setup runs incremental.
+    const FString CacheDirectory = FPaths::Combine(
+        FPaths::ProjectSavedDir(),
         TEXT("VotVModBuildHelper"),
         TEXT("GhostMappings"),
-        FGuid::NewGuid().ToString(EGuidFormats::Digits)
+        Owner,
+        Repository
     );
-    const FString ArchivePath = FPaths::Combine(
-        TemporaryDirectory,
-        TEXT("ghost-mappings.zip")
-    );
-    const FString ExtractDirectory = FPaths::Combine(
-        TemporaryDirectory,
-        TEXT("Extracted")
-    );
-    const FString DownloadUrl = FString::Printf(
-        TEXT("https://codeload.github.com/%s/%s/zip/refs/heads/main"),
+    const FString RepositoryUrl = FString::Printf(
+        TEXT("https://github.com/%s/%s.git"),
         *Owner,
         *Repository
     );
-
     IPlatformFile& PlatformFile =
         FPlatformFileManager::Get().GetPlatformFile();
-    if (!PlatformFile.CreateDirectoryTree(*TemporaryDirectory))
+    if (!PlatformFile.CreateDirectoryTree(*FPaths::GetPath(CacheDirectory)))
     {
         Complete(
             OnComplete,
             false,
-            TEXT("Skipped ghost mappings: could not create a temporary download folder.")
+            TEXT("Skipped ghost mappings: could not create the local Git cache folder.")
         );
         return;
     }
 
-    ActiveDownloadRequest = FHttpModule::Get().CreateRequest();
-    ActiveDownloadRequest->SetURL(DownloadUrl);
-    ActiveDownloadRequest->SetVerb(TEXT("GET"));
-    ActiveDownloadRequest->OnProcessRequestComplete().BindLambda(
-        [OnComplete, Repository, TemporaryDirectory, ArchivePath, ExtractDirectory](
-            FHttpRequestPtr,
-            FHttpResponsePtr Response,
-            bool bWasSuccessful
-        )
+    bInstallationInProgress = true;
+    ShowProgress(TEXT("Ghost mappings: checking Git LFS..."));
+
+    Async(EAsyncExecution::ThreadPool,
+        [OnComplete, Repository, RepositoryUrl, CacheDirectory, bRemoveUnsupportedAudioDeviceMapping]()
         {
-            IPlatformFile& CallbackPlatformFile =
+            FString GitError;
+            if (!RunGit(TEXT("lfs version"), GitError))
+            {
+                AsyncTask(ENamedThreads::GameThread,
+                    [OnComplete, GitError]()
+                    {
+                        Complete(
+                            OnComplete,
+                            false,
+                            FString::Printf(
+                                TEXT("Skipped ghost mappings: Git LFS is required to download the real Unreal assets. Install Git for Windows with Git LFS, then retry. %s"),
+                                *GitError
+                            )
+                        );
+                    }
+                );
+                return;
+            }
+
+            IPlatformFile& BackgroundPlatformFile =
                 FPlatformFileManager::Get().GetPlatformFile();
-            const int32 HttpCode = Response.IsValid()
-                ? Response->GetResponseCode()
-                : 0;
-            if (!bWasSuccessful || !Response.IsValid() || HttpCode != 200)
+            bool bRepositoryChanged = !BackgroundPlatformFile.DirectoryExists(*CacheDirectory);
+
+            if (bRepositoryChanged)
             {
-                Complete(
-                    OnComplete,
-                    false,
-                    FString::Printf(
-                        TEXT("Skipped ghost mappings: GitHub download failed (HTTP %d)."),
-                        HttpCode
-                    )
+                AsyncTask(ENamedThreads::GameThread, []()
+                {
+                    ShowProgress(TEXT("Ghost mappings: cloning the repository..."));
+                });
+
+                const FString CloneArguments = FString::Printf(
+                    TEXT("clone --depth 1 \"%s\" \"%s\""),
+                    *RepositoryUrl,
+                    *CacheDirectory
                 );
-                return;
+                if (!RunGit(CloneArguments, GitError))
+                {
+                    AsyncTask(ENamedThreads::GameThread,
+                        [OnComplete, GitError]()
+                        {
+                            Complete(
+                                OnComplete,
+                                false,
+                                FString::Printf(
+                                    TEXT("Skipped ghost mappings: could not clone the GitHub repository. %s"),
+                                    *GitError
+                                )
+                            );
+                        }
+                    );
+                    return;
+                }
+            }
+            else
+            {
+                AsyncTask(ENamedThreads::GameThread, []()
+                {
+                    ShowProgress(TEXT("Ghost mappings: checking for repository updates..."));
+                });
+
+                const FString FetchArguments = FString::Printf(
+                    TEXT("-C \"%s\" fetch --quiet origin main"),
+                    *CacheDirectory
+                );
+                if (!RunGit(FetchArguments, GitError))
+                {
+                    AsyncTask(ENamedThreads::GameThread,
+                        [OnComplete, GitError]()
+                        {
+                            Complete(
+                                OnComplete,
+                                false,
+                                FString::Printf(
+                                    TEXT("Skipped ghost mappings: could not check the GitHub repository for updates. %s"),
+                                    *GitError
+                                )
+                            );
+                        }
+                    );
+                    return;
+                }
+
+                FString LocalRevision;
+                FString RemoteRevision;
+                const FString LocalRevisionArguments = FString::Printf(
+                    TEXT("-C \"%s\" rev-parse HEAD"),
+                    *CacheDirectory
+                );
+                const FString RemoteRevisionArguments = FString::Printf(
+                    TEXT("-C \"%s\" rev-parse origin/main"),
+                    *CacheDirectory
+                );
+                if (!RunGit(LocalRevisionArguments, GitError, &LocalRevision) ||
+                    !RunGit(RemoteRevisionArguments, GitError, &RemoteRevision))
+                {
+                    AsyncTask(ENamedThreads::GameThread,
+                        [OnComplete, GitError]()
+                        {
+                            Complete(
+                                OnComplete,
+                                false,
+                                FString::Printf(
+                                    TEXT("Skipped ghost mappings: could not read the cached repository revision. %s"),
+                                    *GitError
+                                )
+                            );
+                        }
+                    );
+                    return;
+                }
+
+                bRepositoryChanged =
+                    !LocalRevision.TrimStartAndEnd().Equals(
+                        RemoteRevision.TrimStartAndEnd(),
+                        ESearchCase::CaseSensitive
+                    );
+
+                if (bRepositoryChanged)
+                {
+                    const FString PullArguments = FString::Printf(
+                        TEXT("-C \"%s\" pull --ff-only origin main"),
+                        *CacheDirectory
+                    );
+                    if (!RunGit(PullArguments, GitError))
+                    {
+                        AsyncTask(ENamedThreads::GameThread,
+                            [OnComplete, GitError]()
+                            {
+                                Complete(
+                                    OnComplete,
+                                    false,
+                                    FString::Printf(
+                                        TEXT("Skipped ghost mappings: could not update the cached repository. %s"),
+                                        *GitError
+                                    )
+                                );
+                            }
+                        );
+                        return;
+                    }
+                }
             }
 
-            if (!FFileHelper::SaveArrayToFile(
-                Response->GetContent(),
-                *ArchivePath
-            ))
+            if (bRepositoryChanged)
             {
-                Complete(
-                    OnComplete,
-                    false,
-                    TEXT("Skipped ghost mappings: GitHub download completed, but the ZIP could not be saved.")
-                );
-                return;
-            }
+                AsyncTask(ENamedThreads::GameThread, []()
+                {
+                    ShowProgress(TEXT("Ghost mappings: downloading changed Git LFS asset files..."));
+                });
 
-            if (!CallbackPlatformFile.CreateDirectoryTree(*ExtractDirectory))
-            {
-                Complete(
-                    OnComplete,
-                    false,
-                    TEXT("Skipped ghost mappings: could not create a temporary extraction folder.")
+                const FString LfsArguments = FString::Printf(
+                    TEXT("-C \"%s\" lfs pull"),
+                    *CacheDirectory
                 );
-                return;
+                if (!RunGit(LfsArguments, GitError))
+                {
+                    AsyncTask(ENamedThreads::GameThread,
+                        [OnComplete, GitError]()
+                        {
+                            Complete(
+                                OnComplete,
+                                false,
+                                FString::Printf(
+                                    TEXT("Skipped ghost mappings: Git LFS could not download the Unreal assets. %s"),
+                                    *GitError
+                                )
+                            );
+                        }
+                    );
+                    return;
+                }
             }
-
-            int32 TarExitCode = INDEX_NONE;
-            FString TarOutput;
-            FString TarError;
-            const FString TarArguments = FString::Printf(
-                TEXT("-xf \"%s\" -C \"%s\""),
-                *ArchivePath,
-                *ExtractDirectory
-            );
-            const bool bTarStarted = FPlatformProcess::ExecProcess(
-                *GetSystemExecutable(TEXT("tar.exe")),
-                *TarArguments,
-                &TarExitCode,
-                &TarOutput,
-                &TarError
-            );
 
             const FString SourceContentDirectory = FPaths::Combine(
-                ExtractDirectory,
-                Repository + TEXT("-main"),
+                CacheDirectory,
                 TEXT("Content")
             );
-            if (!bTarStarted || TarExitCode != 0 ||
-                !CallbackPlatformFile.DirectoryExists(*SourceContentDirectory))
+            if (!BackgroundPlatformFile.DirectoryExists(*SourceContentDirectory))
             {
-                Complete(
-                    OnComplete,
-                    false,
-                    FString::Printf(
-                        TEXT("Skipped ghost mappings: the downloaded ZIP could not be extracted (tar started: %s, exit code: %d). %s"),
-                        bTarStarted ? TEXT("yes") : TEXT("no"),
-                        TarExitCode,
-                        *TarError.Right(1000)
-                    )
+                AsyncTask(ENamedThreads::GameThread,
+                    [OnComplete]()
+                    {
+                        Complete(
+                            OnComplete,
+                            false,
+                            TEXT("Skipped ghost mappings: the cloned repository does not contain a Content folder.")
+                        );
+                    }
                 );
                 return;
             }
 
-            if (!CallbackPlatformFile.CopyDirectoryTree(
-                *FPaths::ProjectContentDir(),
-                *SourceContentDirectory,
-                true
-            ))
+            TArray<FString> DestinationAssetFiles;
+            if (bRepositoryChanged)
             {
-                Complete(
-                    OnComplete,
-                    false,
-                    TEXT("Skipped ghost mappings: downloaded the archive, but could not merge its Content folder into this project.")
-                );
-                return;
+                FindAssetFiles(SourceContentDirectory, DestinationAssetFiles);
+                if (!BackgroundPlatformFile.CopyDirectoryTree(
+                    *FPaths::ProjectContentDir(),
+                    *SourceContentDirectory,
+                    true
+                ))
+                {
+                    AsyncTask(ENamedThreads::GameThread,
+                        [OnComplete]()
+                        {
+                            Complete(
+                                OnComplete,
+                                false,
+                                TEXT("Skipped ghost mappings: downloaded the assets, but could not merge their Content folder into this project.")
+                            );
+                        }
+                    );
+                    return;
+                }
             }
 
-            CallbackPlatformFile.DeleteDirectoryRecursively(*TemporaryDirectory);
-            Complete(
-                OnComplete,
-                true,
-                FString::Printf(
-                    TEXT("Downloaded and updated ghost mappings from %s. Restart required."),
-                    *Repository
-                )
+            AsyncTask(ENamedThreads::GameThread,
+                [OnComplete, Repository, bRepositoryChanged, bRemoveUnsupportedAudioDeviceMapping, DestinationAssetFiles = MoveTemp(DestinationAssetFiles)]() mutable
+                {
+                    if (bRepositoryChanged)
+                    {
+                        ShowProgress(TEXT("Ghost mappings: registering assets with Unreal..."));
+
+                        FScopedSlowTask AssetScanTask(
+                            1.0f,
+                            FText::FromString(TEXT("Registering ghost mappings with the Asset Registry..."))
+                        );
+                        AssetScanTask.MakeDialog();
+                        AssetScanTask.EnterProgressFrame();
+
+                        FAssetRegistryModule& AssetRegistryModule =
+                            FModuleManager::LoadModuleChecked<FAssetRegistryModule>(
+                                TEXT("AssetRegistry")
+                            );
+                        AssetRegistryModule.Get().ScanFilesSynchronous(
+                            DestinationAssetFiles,
+                            true
+                        );
+                    }
+
+                    const FString CompatibilityResult =
+                        bRemoveUnsupportedAudioDeviceMapping
+                        ? RemoveUnsupportedAudioDeviceMappings()
+                        : TEXT("");
+
+                    Complete(
+                        OnComplete,
+                        true,
+                        bRepositoryChanged
+                        ? FString::Printf(
+                            TEXT("Downloaded, imported, and registered %d ghost-mapping assets from %s.%s Restart required."),
+                            DestinationAssetFiles.Num(),
+                            *Repository,
+                            *CompatibilityResult
+                        )
+                        : FString::Printf(
+                            TEXT("Ghost mappings from %s are already up to date; no asset download was needed.%s"),
+                            *Repository,
+                            *CompatibilityResult
+                        )
+                    );
+                }
             );
         }
     );
-
-    if (!ActiveDownloadRequest->ProcessRequest())
-    {
-        Complete(
-            OnComplete,
-            false,
-            TEXT("Skipped ghost mappings: Unreal could not start the GitHub HTTP request.")
-        );
-    }
 #endif
 }

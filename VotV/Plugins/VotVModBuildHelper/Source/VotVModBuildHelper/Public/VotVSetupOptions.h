@@ -145,8 +145,8 @@ public:
 	EditAnywhere,
 	Category = "Mod Setup",
 	meta = (
-		DisplayName = "Import Ghost Mappings",
-		Tooltip = "Ghost Mappings provided by modestimpala / VotV_ghostmap")
+		DisplayName = "Download or Update Ghost Mappings",
+		Tooltip = "Downloads ghost mappings the first time. Later runs check the saved Git cache and download only repository changes.")
 	)
 	bool bImportGhostMappings = true;
 
@@ -157,10 +157,21 @@ public:
 		meta = (
 			DisplayName = "Ghost Mappings GitHub Repository",
 			EditCondition = "bImportGhostMappings",
-			ToolTip = "GitHub repository in owner/repository form. Its main branch must contain a Content folder. Matching ghost-mapping files in this project will be updated."
+			ToolTip = "GitHub repository in owner/repository form. Its main branch must contain a Content folder. Matching ghost-mapping files in this project will be updated only when the repository has changed."
 		)
 	)
 	FString GhostMappingsRepository = TEXT("modestimpala/VotV_ghostmap");
+
+	UPROPERTY(
+		Config,
+		EditAnywhere,
+		Category = "Mod Setup",
+		meta = (
+			DisplayName = "Remove Unsupported Audio Device Mapping",
+			ToolTip = "Removes the getAudioDevices mapping signature, which requires the RuntimeAudioImporter C++ plugin. This keeps mainGamemode and its pLog functions usable in a normal VotV mod project. Disable only when that plugin is installed and you need audio-device access."
+		)
+	)
+	bool bRemoveUnsupportedAudioDeviceMapping = true;
 	
 	UPROPERTY(
 		Config,

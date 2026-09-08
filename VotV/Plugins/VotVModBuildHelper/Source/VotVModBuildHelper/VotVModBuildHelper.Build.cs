@@ -47,7 +47,7 @@ public class VotVModBuildHelper : ModuleRules
 				"BlueprintGraph",
 				"UATHelper",
 				"Json",
-				"HTTP",
+				"AssetRegistry",
 				// ... add private dependencies that you statically link with here ...	
 			}
 			);
