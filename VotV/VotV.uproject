@@ -59,31 +59,6 @@
 			"Name": "GraphPrinter",
 			"Enabled": true,
 			"MarketplaceURL": "com.epicgames.launcher://ue/marketplace/content/466303b6cd724968b3ee0a1a1b623f4b"
-		},
-		{
-			"Name": "FileSDK",
-			"Enabled": true,
-			"MarketplaceURL": "com.epicgames.launcher://ue/marketplace/product/4f737815666c4e7dabf2043fb55a8419"
-		},
-		{
-			"Name": "LowEntryExtStdLib",
-			"Enabled": true,
-			"MarketplaceURL": "com.epicgames.launcher://ue/marketplace/content/846c2ad08f164f45b0335ecebf85361e"
-		},
-		{
-			"Name": "RyHelpfulHelpers",
-			"Enabled": true,
-			"MarketplaceURL": "com.epicgames.launcher://ue/marketplace/product/25653d83f1f84775b09ed750659f9ca3"
-		},
-		{
-			"Name": "VictoryBPLibrary",
-			"Enabled": true,
-			"MarketplaceURL": "http://www.ue4code.com"
-		},
-		{
-			"Name": "ElectronicNodes",
-			"Enabled": true,
-			"MarketplaceURL": "com.epicgames.launcher://ue/marketplace/content/5cb2a394d0c04e73891762be4cbd7216"
 		}
 	]
 }
